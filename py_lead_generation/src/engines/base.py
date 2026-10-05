@@ -1,5 +1,5 @@
 import asyncio
-from playwright.async_api import Playwright, async_playwright
+from playwright.async_api import Playwright, async_playwright, TimeoutError as PlaywrightTimeoutError
 
 from py_lead_generation.src.misc.writer import CsvWriter
 from py_lead_generation.src.engines.playwright_config import PlaywrightEngineConfig
@@ -9,95 +9,244 @@ class BaseEngine(PlaywrightEngineConfig):
     '''
     `BaseEngine`
 
-    Base engine class expressing methods, which are shared between all engines, does not provide implementation of `AbstractEngine` methods
+    Base engine class expressing methods, which are shared between all engines.
     '''
 
     async def run(self) -> None:
         '''
-        Uses headles webdriver powered by Playwright
+        Uses headless webdriver powered by Playwright.
 
-        Creates a web url based on initialized parameters
+        Creates a web URL based on initialized parameters.
 
-        Parses results by given query and url one by one
+        Parses results by given query and URL one by one.
 
-        Assigns collected results to `.entries`
-
-        To save the results call `.save_to_csv()` method after       
+        Assigns collected results to `.entries`.
         '''
+
         async with async_playwright() as playwright:
+
             self.playwright: Playwright = playwright
+
             await self._setup_browser()
-            await self._open_url_and_wait(self.url)
+
+            # Open the initial Google Maps search page.
+            await self._open_url_and_wait(
+                self.url,
+                3,
+            )
+
+            # Find business URLs.
             urls: list[str] = await self._get_search_results_urls()
-            self._entries: list[dict] = await self._get_search_results_entries(urls)
+
+            # Open and parse each business.
+            self._entries: list[dict] = (
+                await self._get_search_results_entries(
+                    urls,
+                    db=getattr(self, "db", None),
+                )
+            )
+
             await self.browser.close()
 
-    def save_to_csv(self, filename: str = None) -> None:
+    def save_to_csv(
+        self,
+        filename: str = None,
+    ) -> None:
         '''
-        `filename: str = None` - optional parameter, by default uses `self.FILENAME`
-        
-        If file with such name already exists, it will not overwrite it but append newly found entries to existing ones
+        Save collected entries to CSV.
+        '''
 
-        If file with such name does not exist, it will create a new csv file with predetermined fieldnames
-        '''
         if filename:
             self.FILENAME = filename
 
-        if not self.FILENAME.endswith('.csv'):
-            raise ValueError('Use .csv file extension')
+        if not self.FILENAME.endswith(".csv"):
+            raise ValueError(
+                "Use .csv file extension"
+            )
+
         if not self._entries:
             raise NotImplementedError(
-                'Entries are empty, call .run() method first to save them'
+                "Entries are empty, call .run() method first to save them"
             )
-        csv_writer = CsvWriter(self.FILENAME, self.FIELD_NAMES)
-        csv_writer.append(self._entries)
+
+        csv_writer = CsvWriter(
+            self.FILENAME,
+            self.FIELD_NAMES,
+        )
+
+        csv_writer.append(
+            self._entries
+        )
 
     @property
     def entries(self) -> list[dict]:
         '''
-        Returns `list[dict]` typed entries once `.run()` method was called
+        Returns collected entries once `.run()` was called.
         '''
+
         if not self._entries:
             raise NotImplementedError(
-                'Entries are empty, call .run() method first to create them'
+                "Entries are empty, call .run() method first to create them"
             )
+
         return self._entries
 
     @entries.setter
     def entries(self, _) -> None:
         '''
-        You cannot do that ;)
-
-        Made for durability reasons
+        Prevent direct modification of entries.
         '''
-        raise ValueError('Cannot set value to data. This is not allowed')
 
-    async def _open_url_and_wait(self, url: str, sleep_duration_s: int = 3) -> None:
+        raise ValueError(
+            "Cannot set value to data. This is not allowed"
+        )
+
+    async def _open_url_and_wait(
+        self,
+        url: str,
+        sleep_duration_s: float = 3,
+    ) -> bool:
         '''
-        `url: str` - url to open
-        `sleep_duration_s: int = 3` - amount of seconds to wait for the page to load before any operations on that page
+        Open a URL safely.
 
-        Navigates to initialized `self.url` and waits for `sleep_duration_s` seconds
+        Returns:
+            True  -> page opened successfully
+            False -> navigation failed/timed out
+
+        A failed individual URL does not stop the entire scrape.
         '''
-        await self.page.goto(url)
-        await asyncio.sleep(sleep_duration_s)
 
-    async def _get_search_results_entries(self, urls: list[str]) -> list[dict]:
+        try:
+
+            await self.page.goto(
+                url,
+                wait_until="domcontentloaded",
+                timeout=30000,
+            )
+
+            await asyncio.sleep(
+                sleep_duration_s
+            )
+
+            return True
+
+        except PlaywrightTimeoutError:
+
+            print(
+                f"Warning: Timeout while opening URL:"
+            )
+
+            print(
+                f"  {url}"
+            )
+
+            print(
+                "Skipping this business and continuing..."
+            )
+
+            return False
+
+        except Exception as e:
+
+            print(
+                f"Warning: Failed to open URL:"
+            )
+
+            print(
+                f"  {url}"
+            )
+
+            print(
+                f"  Error: {type(e).__name__}: {e}"
+            )
+
+            print(
+                "Skipping this business and continuing..."
+            )
+
+            return False
+
+    async def _get_search_results_entries(
+        self,
+        urls: list[str],
+        db=None,
+        target_needed: int | None = None,
+    ) -> list[dict]:
         '''
-        `urls: list[str]` - list of urls for google maps entities to scrape for
+        Goes over each Google Maps business URL.
 
-        Goes over each url in the list and retreives data from opening page one by one
-
-        Searches for data using exact image source values selectors, no other unique way to extract data using selectors is not found yet
-
-        Returns `list[dict]` typed search result entries for each seperate given url from `urls`
+        If a URL is already present in the database, it is skipped
+        immediately without wasting time on browser page navigation.
         '''
+
         entries = []
-        for url in urls:
-            await self._open_url_and_wait(url, 1.5)
-            html = await self.page.content()
-            data = self._parse_data_with_soup(html)
-            entry = dict(zip(self.FIELD_NAMES, data))
-            entries.append(entry)
+        total_urls = len(urls)
+
+        for index, url in enumerate(
+            urls,
+            start=1,
+        ):
+            # Pre-filter already known URLs before navigation (Feature 4)
+            if db and db.is_url_duplicate(url):
+                print(
+                    f"[{index}/{total_urls}] Skipping already scraped business (in database): {url[:60]}..."
+                )
+                continue
+
+            print(
+                f"Processing business "
+                f"{index}/{total_urls}..."
+            )
+
+            success = await self._open_url_and_wait(
+                url,
+                1.5,
+            )
+
+            # ------------------------------------------------
+            # Skip failed navigation
+            # ------------------------------------------------
+
+            if not success:
+                continue
+
+            try:
+
+                html = await self.page.content()
+
+                data = self._parse_data_with_soup(
+                    html
+                )
+
+                entry = dict(
+                    zip(
+                        self.FIELD_NAMES,
+                        data,
+                    )
+                )
+                entry["MapsLink"] = url
+
+                entries.append(
+                    entry
+                )
+
+            except Exception as e:
+
+                print(
+                    "Warning: Could not parse business page."
+                )
+
+                print(
+                    f"  Error: {type(e).__name__}: {e}"
+                )
+
+                print(
+                    "Skipping this business and continuing..."
+                )
+
+        print(
+            f"Successfully parsed "
+            f"{len(entries)} businesses."
+        )
 
         return entries
